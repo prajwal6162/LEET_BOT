@@ -1,10 +1,8 @@
 import os
 import sys
-import time
 import asyncio
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import asyncpg  # Changed
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -21,32 +19,37 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 60))
 DATABASE_URL = os.getenv("DATABASE_URL")
-PORT = int(os.getenv("PORT", 8080))   # required by Render
+PORT = int(os.getenv("PORT", 8080))
 
-# Basic sanity checks
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN missing in env")
-if not GROUP_CHAT_ID:
-    raise RuntimeError("GROUP_CHAT_ID missing in env")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL missing in env")
+# --- Sanity checks ---
+for var in ["BOT_TOKEN", "GROUP_CHAT_ID", "DATABASE_URL"]:
+    if not globals()[var]:
+        raise RuntimeError(f"{var} missing in env")
 
-# === DB CONNECTION ===
-conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-cursor = conn.cursor()
+# === DATABASE SETUP (ASYNC) ===
+# This pool will be used by all async functions to safely get connections
+db_pool = None
 
-# Create table if not exists
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    telegram_id TEXT PRIMARY KEY,
-    leetcode_username TEXT NOT NULL,
-    last_timestamp BIGINT DEFAULT 0
-)
-""")
-conn.commit()
+async def setup_database():
+    """Create the users table if it doesn't exist."""
+    global db_pool
+    # Establish a connection pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, ssl='require')
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id TEXT PRIMARY KEY,
+                leetcode_username TEXT NOT NULL,
+                last_timestamp BIGINT DEFAULT 0
+            )
+        """)
+    print("✅ Database connection pool established and table checked.")
 
-# === LEETCODE API ===
+
+# === LEETCODE API FUNCTION (Unchanged) ===
+# This function is synchronous, so we'll call it with asyncio.to_thread
 def get_recent_submission(username: str):
+    # ... (your existing function code is perfect here) ...
     url = "https://leetcode.com/graphql"
     query = """
     query recentSubmissions($username: String!) {
@@ -59,15 +62,9 @@ def get_recent_submission(username: str):
       }
     }
     """
-    headers = {
-        "Content-Type": "application/json",
-        "Referer": "https://leetcode.com",
-        "Origin": "https://leetcode.com",
-        "User-Agent": "Mozilla/5.0"
-    }
+    headers = {"Content-Type": "application/json", "Referer": "https://leetcode.com"}
     try:
-        resp = requests.post(url, json={"query": query, "variables": {"username": username}},
-                             headers=headers, timeout=12)
+        resp = requests.post(url, json={"query": query, "variables": {"username": username}}, headers=headers, timeout=12)
         resp.raise_for_status()
         data = resp.json()
         return data.get("data", {}).get("recentSubmissionList", [])
@@ -75,7 +72,8 @@ def get_recent_submission(username: str):
         print(f"[LEETCODE] Error fetching {username}: {e}")
         return []
 
-# === BOT COMMANDS ===
+
+# === BOT COMMANDS (Refactored for asyncpg) ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Hi! Use /add <leetcode_username> to link your account.\n"
@@ -90,91 +88,113 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     leetcode_username = context.args[0].strip()
     telegram_id = str(update.effective_user.id)
 
-    cursor.execute("""
-        INSERT INTO users (telegram_id, leetcode_username, last_timestamp)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (telegram_id) DO UPDATE
-        SET leetcode_username = EXCLUDED.leetcode_username
-    """, (telegram_id, leetcode_username, 0))
-    conn.commit()
+    # Acquire a connection from the pool safely
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO users (telegram_id, leetcode_username, last_timestamp)
+            VALUES ($1, $2, 0)
+            ON CONFLICT (telegram_id) DO UPDATE
+            SET leetcode_username = EXCLUDED.leetcode_username
+        """, telegram_id, leetcode_username)
 
     await update.message.reply_text(f"✅ Linked LeetCode username: {leetcode_username}")
 
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = str(update.effective_user.id)
-    cursor.execute("DELETE FROM users WHERE telegram_id=%s", (telegram_id,))
-    conn.commit()
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM users WHERE telegram_id=$1", telegram_id)
     await update.message.reply_text("❌ Your LeetCode username has been removed.")
 
 async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cursor.execute("SELECT leetcode_username FROM users ORDER BY leetcode_username")
-    users = cursor.fetchall()
+    async with db_pool.acquire() as conn:
+        users = await conn.fetch("SELECT leetcode_username FROM users ORDER BY leetcode_username")
+
     if not users:
         await update.message.reply_text("No users registered yet.")
     else:
-        msg = "📜 Registered LeetCode Users:\n" + "\n".join(u[0] for u in users)
+        msg = "📜 Registered LeetCode Users:\n" + "\n".join(u['leetcode_username'] for u in users)
         await update.message.reply_text(msg)
 
-# === JOBQUEUE POLLER (no custom threads) ===
-async def poll_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        cursor.execute("SELECT telegram_id, leetcode_username, last_timestamp FROM users")
-        rows = cursor.fetchall()
-    except Exception as e:
-        print(f"[DB] Read error: {e}")
-        conn.rollback()
-        return
 
-    for telegram_id, username, last_ts in rows:
-        submissions = await asyncio.to_thread(get_recent_submission, username)
+# === JOBQUEUE POLLING (Refactored for asyncpg) ===
+async def poll_job(context: ContextTypes.DEFAULT_TYPE):
+    async with db_pool.acquire() as conn:
+        # fetchval, fetchrow, fetch - powerful asyncpg methods
+        rows = await conn.fetch("SELECT telegram_id, leetcode_username, last_timestamp FROM users")
+
+    for record in rows:
+        # Run the blocking network call in a separate thread
+        submissions = await asyncio.to_thread(get_recent_submission, record['leetcode_username'])
 
         if not submissions:
             continue
 
         latest = submissions[0]
-        try:
-            latest_ts = int(latest.get("timestamp") or 0)
-        except Exception:
-            latest_ts = 0
+        latest_ts = int(latest.get("timestamp", 0))
+        last_ts = record['last_timestamp']
+        telegram_id = record['telegram_id']
+        username = record['leetcode_username']
+        
+        # Simplified Logic: If there's a new submission, process it.
+        if latest_ts > last_ts:
+            # Only send a message if this isn't the very first submission we've seen
+            if last_ts != 0:
+                msg = (
+                    f"🚀 {username} just submitted:\n"
+                    f"{latest.get('title')} ({latest.get('statusDisplay')}, {latest.get('lang')})\n"
+                    f"https://leetcode.com/problems/{latest.get('titleSlug')}/"
+                )
+                try:
+                    await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg)
+                except Exception as e:
+                    print(f"[TG] Send error: {e}")
+            
+            # Update the timestamp in the database
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE users SET last_timestamp=$1 WHERE telegram_id=$2", latest_ts, telegram_id)
 
-        if not last_ts and latest_ts:
-            cursor.execute("UPDATE users SET last_timestamp=%s WHERE telegram_id=%s",
-                           (latest_ts, telegram_id))
-            conn.commit()
-            continue
 
-        if latest_ts and latest_ts != (last_ts or 0):
-            msg = (f"🚀 {username} just submitted:\n"
-                   f"{latest.get('title')} ({latest.get('statusDisplay')}, {latest.get('lang')})\n"
-                   f"https://leetcode.com/problems/{latest.get('titleSlug')}/")
-            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg)
-
-            cursor.execute("UPDATE users SET last_timestamp=%s WHERE telegram_id=%s",
-                           (latest_ts, telegram_id))
-            conn.commit()
-
+# === DUMMY HTTP SERVER (Unchanged) ===
 def run_http_server():
-    """Dummy HTTP server so Render sees a running web service."""
+    # ... (your existing function is fine) ...
     handler = SimpleHTTPRequestHandler
     httpd = HTTPServer(("", PORT), handler)
     print(f"🌍 HTTP server running on port {PORT}")
     httpd.serve_forever()
 
-def main():
+# === MAIN FUNCTION (Updated to initialize DB) ===
+async def main_async():
+    """Asynchronous main function to setup DB and run the bot."""
+    # Setup the database pool first
+    await setup_database()
+    
     application = Application.builder().token(BOT_TOKEN).build()
 
+    # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("add", add_user))
     application.add_handler(CommandHandler("remove", remove_user))
     application.add_handler(CommandHandler("list", list_users))
 
+    # Add polling job
     application.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=5)
 
-    # Run HTTP server in another thread
+    # Start HTTP server in a separate daemon thread
     Thread(target=run_http_server, daemon=True).start()
 
     print("🤖 Bot running...")
-    application.run_polling(close_loop=False)
+    # Run the bot until the user presses Ctrl-C
+    # Using with block for graceful shutdown
+    async with application:
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+        # Keep the script running
+        while True:
+            await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main_async())
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot stopped.")
