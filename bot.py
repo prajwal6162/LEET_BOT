@@ -8,6 +8,8 @@ from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from threading import Thread
+from http.server import SimpleHTTPRequestHandler, HTTPServer
 
 # --- Windows event loop fix ---
 if sys.platform.startswith("win"):
@@ -19,6 +21,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", 60))
 DATABASE_URL = os.getenv("DATABASE_URL")
+PORT = int(os.getenv("PORT", 8080))   # required by Render
 
 # Basic sanity checks
 if not BOT_TOKEN:
@@ -123,11 +126,9 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     for telegram_id, username, last_ts in rows:
-        # Make the blocking HTTP call in a thread to avoid blocking the event loop
         submissions = await asyncio.to_thread(get_recent_submission, username)
 
         if not submissions:
-            print(f"[POLL] {username}: no submissions returned")
             continue
 
         latest = submissions[0]
@@ -136,51 +137,41 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             latest_ts = 0
 
-        print(f"[POLL] {username}: last_ts={last_ts} latest_ts={latest_ts}")
-
-        # First-time setup: don't spam old submission, just record it
         if not last_ts and latest_ts:
-            try:
-                cursor.execute("UPDATE users SET last_timestamp=%s WHERE telegram_id=%s",
-                               (latest_ts, telegram_id))
-                conn.commit()
-                print(f"[POLL] Initialized last_timestamp for {username} -> {latest_ts}")
-            except Exception as e:
-                print(f"[DB] Init update error: {e}")
-                conn.rollback()
+            cursor.execute("UPDATE users SET last_timestamp=%s WHERE telegram_id=%s",
+                           (latest_ts, telegram_id))
+            conn.commit()
             continue
 
-        # New submission detected
         if latest_ts and latest_ts != (last_ts or 0):
             msg = (f"🚀 {username} just submitted:\n"
                    f"{latest.get('title')} ({latest.get('statusDisplay')}, {latest.get('lang')})\n"
                    f"https://leetcode.com/problems/{latest.get('titleSlug')}/")
-            try:
-                await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg)
-            except Exception as e:
-                print(f"[TG] Send error: {e}")
+            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg)
 
-            # Update last_timestamp
-            try:
-                cursor.execute("UPDATE users SET last_timestamp=%s WHERE telegram_id=%s",
-                               (latest_ts, telegram_id))
-                conn.commit()
-                print(f"[DB] Updated {username} -> {latest_ts}")
-            except Exception as e:
-                print(f"[DB] Update error: {e}")
-                conn.rollback()
+            cursor.execute("UPDATE users SET last_timestamp=%s WHERE telegram_id=%s",
+                           (latest_ts, telegram_id))
+            conn.commit()
+
+def run_http_server():
+    """Dummy HTTP server so Render sees a running web service."""
+    handler = SimpleHTTPRequestHandler
+    httpd = HTTPServer(("", PORT), handler)
+    print(f"🌍 HTTP server running on port {PORT}")
+    httpd.serve_forever()
 
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Commands
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("add", add_user))
     application.add_handler(CommandHandler("remove", remove_user))
     application.add_handler(CommandHandler("list", list_users))
 
-    # Schedule polling via JobQueue (no manual threads)
     application.job_queue.run_repeating(poll_job, interval=POLL_INTERVAL, first=5)
+
+    # Run HTTP server in another thread
+    Thread(target=run_http_server, daemon=True).start()
 
     print("🤖 Bot running...")
     application.run_polling(close_loop=False)
